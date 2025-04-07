@@ -22,19 +22,19 @@ type SensorMessageInput struct {
 	Description int    `json:"description"`
 	Emitter     string `json:"emitter"`
 	Topic       string `json:"topic"`
-	Serie       string `json:"serie"`         // <- importante
+	Serie       string `json:"serie"`
 	CreatedAt   string `json:"createdAt"`
 }
 
 // 🟢 Estructura del mensaje que se envía al frontend
 type SensorMessageOutput struct {
 	ID          int    `json:"id"`
-	Tittle      string `json:"tittle"`        // <- será igual a Emitter
+	Tittle      string `json:"tittle"` // <- será igual a Emitter
 	Description int    `json:"description"`
 	Emitter     string `json:"emitter"`
 	Topic       string `json:"topic"`
-	Serie       string `json:"serie"`         // <- enviado al frontend
-	CreatedAt   string `json:"created_at"`    // <- solo hora
+	Serie       string `json:"serie"`
+	CreatedAt   string `json:"created_at"` // <- solo hora
 }
 
 // 🌐 WebSocket
@@ -52,48 +52,70 @@ var mqttMessageHandler mqtt.MessageHandler = func(client mqtt.Client, msg mqtt.M
 	log.Printf("📡 TOPIC RECIBIDO: %s", msg.Topic())
 	log.Printf("🧾 Payload bruto: %s", string(msg.Payload()))
 
-	if msg.Topic() != "notification" {
-		log.Printf("📛 Mensaje ignorado (topic no es notification): %s", msg.Topic())
+	topic := msg.Topic()
+	if !strings.Contains(topic, "notification") && !strings.Contains(topic, "alert") {
+		log.Printf("📛 Topic ignorado: %s", topic)
 		return
 	}
 
-	// 🔄 Parsear JSON entrante
-	var incoming SensorMessageInput
-	err := json.Unmarshal(msg.Payload(), &incoming)
-	if err != nil {
-		log.Printf("❌ Error al parsear JSON entrante: %s", err)
+	var incoming map[string]interface{}
+	if err := json.Unmarshal(msg.Payload(), &incoming); err != nil {
+		log.Printf("❌ Error al parsear JSON genérico: %s", err)
 		return
 	}
 
-	// ⏰ Extraer solo la hora
-	createdAtTime := incoming.CreatedAt
-	if strings.Contains(createdAtTime, " ") {
-		parts := strings.Split(createdAtTime, " ")
-		if len(parts) == 2 {
-			createdAtTime = parts[1]
+	// Intentar construir SensorMessageInput con redondeo
+	var parsed SensorMessageInput
+
+	if idFloat, ok := incoming["id"].(float64); ok {
+		parsed.ID = int(idFloat)
+	}
+	if title, ok := incoming["title"].(string); ok {
+		parsed.Title = title
+	}
+	if descFloat, ok := incoming["description"].(float64); ok {
+		parsed.Description = int(descFloat + 0.5) // redondeo
+	}
+	if em, ok := incoming["emitter"].(string); ok {
+		parsed.Emitter = em
+	}
+	if t, ok := incoming["topic"].(string); ok {
+		parsed.Topic = t
+	} else {
+		parsed.Topic = topic // usar el topic recibido si no viene en payload
+	}
+	if serie, ok := incoming["serie"].(string); ok {
+		parsed.Serie = serie
+	}
+	if created, ok := incoming["createdAt"].(string); ok {
+		if strings.Contains(created, " ") {
+			parsed.CreatedAt = strings.Split(created, " ")[1]
+		} else {
+			parsed.CreatedAt = created
 		}
 	}
 
-	// 🧾 Construir mensaje para frontend
-	outgoing := SensorMessageOutput{
-		ID:          incoming.ID,
-		Tittle:      strings.TrimSpace(incoming.Emitter),
-		Description: incoming.Description,
-		Emitter:     strings.TrimSpace(incoming.Emitter),
-		Topic:       incoming.Topic,
-		Serie:       incoming.Serie,
-		CreatedAt:   createdAtTime,
+	// Mostrar en consola el JSON procesado
+	output := SensorMessageOutput{
+		ID:          parsed.ID,
+		Tittle:      strings.TrimSpace(parsed.Emitter),
+		Description: parsed.Description,
+		Emitter:     strings.TrimSpace(parsed.Emitter),
+		Topic:       parsed.Topic,
+		Serie:       parsed.Serie,
+		CreatedAt:   parsed.CreatedAt,
 	}
 
-	// 🔐 Enviar solo a los clientes con esa serie
-	message, _ := json.Marshal(outgoing)
+	jsonMsg, _ := json.MarshalIndent(output, "", "  ")
+	log.Printf("📤 Mensaje formateado:\n%s", string(jsonMsg))
 
+	// Enviar por WebSocket solo a los clientes con misma serie
 	mutex.Lock()
 	for client, serieCliente := range clients {
-		if serieCliente != incoming.Serie {
+		if serieCliente != parsed.Serie {
 			continue
 		}
-		err := client.WriteMessage(websocket.TextMessage, message)
+		err := client.WriteMessage(websocket.TextMessage, jsonMsg)
 		if err != nil {
 			log.Printf("❌ Error enviando por WebSocket: %s", err)
 			client.Close()
@@ -123,11 +145,14 @@ func connectMQTT() mqtt.Client {
 	}
 	log.Println("✅ Conectado a MQTT correctamente")
 
-	// Suscribirse a "notification"
-	if token := client.Subscribe("notification", 0, nil); token.Wait() && token.Error() != nil {
-		log.Printf("❌ Error al suscribirse al topic 'notification': %s", token.Error())
-	} else {
-		log.Println("📡 Suscrito al topic: notification")
+	// Suscribirse a topics notification/# y alert/#
+	topics := []string{"notification/#", "alert/#"}
+	for _, t := range topics {
+		if token := client.Subscribe(t, 0, nil); token.Wait() && token.Error() != nil {
+			log.Printf("❌ Error al suscribirse a '%s': %s", t, token.Error())
+		} else {
+			log.Printf("📡 Suscrito al topic: %s", t)
+		}
 	}
 
 	return client
